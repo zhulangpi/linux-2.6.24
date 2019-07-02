@@ -663,6 +663,7 @@ static struct page *__rmqueue_smallest(struct zone *zone, unsigned int order,
 		rmv_page_order(page);
 		area->nr_free--;
 		__mod_zone_page_state(zone, NR_FREE_PAGES, - (1UL << order));
+        /* 如果从大块里分出小块来，剩下的部分需要放到对应的块链表中 */
 		expand(zone, page, order, current_order, area, migratetype);
 		return page;
 	}
@@ -784,9 +785,12 @@ static struct page *__rmqueue_fallback(struct zone *zone, int order,
 			if (unlikely(current_order >= (pageblock_order >> 1)) ||
 					start_migratetype == MIGRATE_RECLAIMABLE) {
 				unsigned long pages;
+                /* 将zone域内page开头的page block内的空闲页转移到start_migratetype迁移类型的buddy链表中，
+                   只会改变空闲页的迁移类型，一个page block内可能有多种不同order的页块 */
 				pages = move_freepages_block(zone, page,
 								start_migratetype);
 
+                /* 如果该page block内有一半以上的页面都被更改了迁移类型，则将整个page block内的页全改掉 */
 				/* Claim the whole block if over half of it is free */
 				if (pages >= (1 << (pageblock_order-1)))
 					set_pageblock_migratetype(page,
@@ -823,8 +827,10 @@ static struct page *__rmqueue(struct zone *zone, unsigned int order,
 {
 	struct page *page;
 
+    /* 先在该域的指定迁移类型中进行分配 */
 	page = __rmqueue_smallest(zone, order, migratetype);
 
+    /* 尝试该域的其他迁移类型 */
 	if (unlikely(!page))
 		page = __rmqueue_fallback(zone, order, migratetype);
 
@@ -1058,26 +1064,31 @@ static struct page *buffered_rmqueue(struct zonelist *zonelist,
 	int migratetype = allocflags_to_migratetype(gfp_flags);
 
 again:
+    /* 关抢占，返回CPU ID */
 	cpu  = get_cpu();
+    /* 单页分配 */
 	if (likely(order == 0)) {
 		struct per_cpu_pages *pcp;
 
 		pcp = &zone_pcp(zone, cpu)->pcp[cold];
 		local_irq_save(flags);
+        /* 如果pcp为空，没有任何空闲页，填充指定迁移类型页到pcp缓存 */
 		if (!pcp->count) {
 			pcp->count = rmqueue_bulk(zone, 0,
 					pcp->batch, &pcp->list, migratetype);
 			if (unlikely(!pcp->count))
 				goto failed;
 		}
-
+        /* pcp缓存不为空，查找指定迁移类型的页 */
 		/* Find a page of the appropriate migrate type */
 		list_for_each_entry(page, &pcp->list, lru)
 			if (page_private(page) == migratetype)
 				break;
 
+        /* pcp缓存中虽然有页，但是没有指定迁移类型的页 */
 		/* Allocate more to the pcp list if necessary */
 		if (unlikely(&page->lru == &pcp->list)) {
+            /* rmqueue_bulk()会将page->private字段置为迁移类型 */
 			pcp->count += rmqueue_bulk(zone, 0,
 					pcp->batch, &pcp->list, migratetype);
 			page = list_entry(pcp->list.next, struct page, lru);
@@ -1085,7 +1096,7 @@ again:
 
 		list_del(&page->lru);
 		pcp->count--;
-	} else {
+	} else {/* 多页分配  */
 		spin_lock_irqsave(&zone->lock, flags);
 		page = __rmqueue(zone, order, migratetype);
 		spin_unlock(&zone->lock);
@@ -1405,10 +1416,12 @@ zonelist_scan:
 			!zlc_zone_worth_trying(zonelist, z, allowednodes))
 				continue;
 		zone = *z;
+        /* 如果分配标志中要求检查CPUSET，检查给定zone是否属于该进程允许运行的CPU */
 		if ((alloc_flags & ALLOC_CPUSET) &&
 			!cpuset_zone_allowed_softwall(zone, gfp_mask))
 				goto try_next_zone;
 
+        /* 检查内存水位并尝试进行回收 */
 		if (!(alloc_flags & ALLOC_NO_WATERMARKS)) {
 			unsigned long mark;
 			if (alloc_flags & ALLOC_WMARK_MIN)
@@ -1419,12 +1432,14 @@ zonelist_scan:
 				mark = zone->pages_high;
 			if (!zone_watermark_ok(zone, order, mark,
 				    classzone_idx, alloc_flags)) {
+                /* 如果不要求zone回收或者回收失败 */
 				if (!zone_reclaim_mode ||
 				    !zone_reclaim(zone, gfp_mask, order))
 					goto this_zone_full;
 			}
 		}
 
+        /* 该zone符合要求，空间也够，分配 */
 		page = buffered_rmqueue(zonelist, zone, order, gfp_mask);
 		if (page)
 			break;
@@ -1464,6 +1479,8 @@ __alloc_pages(gfp_t gfp_mask, unsigned int order,
 	int alloc_flags;
 	int did_some_progress;
 
+    /*一种内核注释，表示如果wait为真，该内核执行路径是可能睡眠的。
+        如果在原子上下文中运行该函数，该函数会打印stack trace*/
 	might_sleep_if(wait);
 
 	if (should_fail_alloc_page(gfp_mask, order))
@@ -1479,6 +1496,10 @@ restart:
 		 */
 		return NULL;
 	}
+
+    /********************
+         第一次分配
+    *********************/
 
 	page = get_page_from_freelist(gfp_mask|__GFP_HARDWALL, order,
 				zonelist, ALLOC_WMARK_LOW|ALLOC_CPUSET);
@@ -1496,6 +1517,7 @@ restart:
 	if (NUMA_BUILD && (gfp_mask & GFP_THISNODE) == GFP_THISNODE)
 		goto nopage;
 
+    /*唤醒备用zone上的异步内存回收线程*/
 	for (z = zonelist->zones; *z; z++)
 		wakeup_kswapd(*z, order);
 
@@ -1510,10 +1532,16 @@ restart:
 	 * set both ALLOC_HARDER (!wait) and ALLOC_HIGH (__GFP_HIGH).
 	 */
 	alloc_flags = ALLOC_WMARK_MIN;
+
+    /* try to alloc harder */
 	if ((unlikely(rt_task(p)) && !in_interrupt()) || !wait)
 		alloc_flags |= ALLOC_HARDER;
+
+    /* Should access emergency pools? */
 	if (gfp_mask & __GFP_HIGH)
 		alloc_flags |= ALLOC_HIGH;
+
+    /* check for correct cpuset */
 	if (wait)
 		alloc_flags |= ALLOC_CPUSET;
 
@@ -1525,6 +1553,9 @@ restart:
 	 * Ignore cpuset if GFP_ATOMIC (!wait) rather than fail alloc.
 	 * See also cpuset_zone_allowed() comment in kernel/cpuset.c.
 	 */
+    /*************************
+        第二次分配
+    **************************/
 	page = get_page_from_freelist(gfp_mask, order, zonelist, alloc_flags);
 	if (page)
 		goto got_pg;
@@ -1532,8 +1563,10 @@ restart:
 	/* This allocation should allow future memory freeing. */
 
 rebalance:
+    /* PF_MEMALLOC: Allocating memory  TIF_MEMDIE: 线程被OOM选中 */
 	if (((p->flags & PF_MEMALLOC) || unlikely(test_thread_flag(TIF_MEMDIE)))
 			&& !in_interrupt()) {
+        /* use emergency reserves */
 		if (!(gfp_mask & __GFP_NOMEMALLOC)) {
 nofail_alloc:
 			/* go through the zonelist yet again, ignoring mins */
@@ -1541,7 +1574,9 @@ nofail_alloc:
 				zonelist, ALLOC_NO_WATERMARKS);
 			if (page)
 				goto got_pg;
+            /* 如果不允许失败，无限循环 */
 			if (gfp_mask & __GFP_NOFAIL) {
+                /* 等待后备存储设备变的不写拥塞（交换或写回时要写外存，等待其写操作完成）*/
 				congestion_wait(WRITE, HZ/50);
 				goto nofail_alloc;
 			}
@@ -1552,7 +1587,9 @@ nofail_alloc:
 	/* Atomic allocations - we can't balance anything */
 	if (!wait)
 		goto nopage;
+    /* 接下来进入低速分配路径 */
 
+    /* 提供重调度机会，防止其他进程饥饿 */
 	cond_resched();
 
 	/* We now go into synchronous reclaim */
@@ -1561,6 +1598,7 @@ nofail_alloc:
 	reclaim_state.reclaimed_slab = 0;
 	p->reclaim_state = &reclaim_state;
 
+    /* 会将最近不活跃的页交换出去，来空出一些内存 */
 	did_some_progress = try_to_free_pages(zonelist->zones, order, gfp_mask);
 
 	p->reclaim_state = NULL;
@@ -1571,11 +1609,13 @@ nofail_alloc:
 	if (order != 0)
 		drain_all_local_pages();
 
+    /* 如果通过交换区空出了一些内存 */
 	if (likely(did_some_progress)) {
 		page = get_page_from_freelist(gfp_mask, order,
 						zonelist, alloc_flags);
 		if (page)
 			goto got_pg;
+    /* Can call down to low-level FS 并且 允许重试 */
 	} else if ((gfp_mask & __GFP_FS) && !(gfp_mask & __GFP_NORETRY)) {
 		if (!try_set_zone_oom(zonelist)) {
 			schedule_timeout_uninterruptible(1);
@@ -1588,6 +1628,7 @@ nofail_alloc:
 		 * a parallel oom killing, we must fail if we're still
 		 * under heavy pressure.
 		 */
+        /* 先尝试下高水位要求下的分配，如果分配成功了说明在之前有进程先做了OOM */
 		page = get_page_from_freelist(gfp_mask|__GFP_HARDWALL, order,
 				zonelist, ALLOC_WMARK_HIGH|ALLOC_CPUSET);
 		if (page) {
@@ -1595,12 +1636,14 @@ nofail_alloc:
 			goto got_pg;
 		}
 
+        /* 对于过大的请求，通常OOM也无能为力 */
 		/* The OOM killer will not help higher order allocs so fail */
 		if (order > PAGE_ALLOC_COSTLY_ORDER) {
 			clear_zonelist_oom(zonelist);
 			goto nopage;
 		}
 
+        /* 执行OOM并从头重试 */
 		out_of_memory(zonelist, gfp_mask, order);
 		clear_zonelist_oom(zonelist);
 		goto restart;
@@ -1614,6 +1657,11 @@ nofail_alloc:
 	 * <= 3, but that may not be true in other implementations.
 	 */
 	do_retry = 0;
+    /* 通过交换来空出内存的方法失败 且 不允许FS操作 */
+
+    /* 没有表示不允许重试的前提下，
+        或需要的页少，或明确表示允许重复，或不允许失败，
+        三种情况下回头重试 */
 	if (!(gfp_mask & __GFP_NORETRY)) {
 		if ((order <= PAGE_ALLOC_COSTLY_ORDER) ||
 						(gfp_mask & __GFP_REPEAT))
@@ -1649,6 +1697,8 @@ fastcall unsigned long __get_free_pages(gfp_t gfp_mask, unsigned int order)
 	page = alloc_pages(gfp_mask, order);
 	if (!page)
 		return 0;
+    /* 根据页描述符返回页映射到的虚拟地址，
+        低端内存线性映射，高端内存哈希表存储 */
 	return (unsigned long) page_address(page);
 }
 
